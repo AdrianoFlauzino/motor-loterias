@@ -1,4 +1,8 @@
-   streamlit
-   pandas
-   numpy
-   plotly
+streamlit
+pandas
+numpy
+plotly
+requests
+xlsxwriter
+openpyxl
+scikit-learn
