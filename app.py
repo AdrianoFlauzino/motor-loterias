@@ -1,384 +1,360 @@
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
+import sys
+import os
+import json
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
+
+# ============================================================
+# CONFIGURAÇÕES GERAIS
+# ============================================================
+
+# URL base do site de Loterias Online da Caixa
+URL_BASE = "https://loteriasonline.caixa.gov.br/"
+
+# Mapeamento de slugs do JSON para URLs relativas/paths do site da Caixa.
+# IMPORTANTE: Esses caminhos podem mudar conforme o site da Caixa é atualizado.
+# Caso o script não encontre a página correta, acesse o site manualmente,
+# navegue até a loteria desejada e copie a URL atualizada.
+URLS_LOTERIAS = {
+    "megasena": "megasena",
+    "lotofacil": "lotofacil",
+    "quina": "quina",
+    "maismilionaria": "maismilionaria",
+    "diadesorte": "diadesorte",
+}
+
+# ============================================================
+# SELETORES CSS (ATUALIZE CONFORME O SITE DA CAIXA MUDAR)
+# ============================================================
+# Os seletores abaixo são exemplos baseados na estrutura comum do site.
+# Como o site da Caixa utiliza frameworks JS (React/Angular), as classes
+# podem mudar frequentemente.
+#
+# COMO INSPECIONAR E ATUALIZAR OS SELETORES:
+# 1. Abra o site no Google Chrome.
+# 2. Pressione F12 para abrir as Ferramentas de Desenvolvedor.
+# 3. Clique no ícone de "inspecionar elemento" (seta no canto superior esquerdo do painel).
+# 4. Passe o mouse sobre o elemento desejado (ex: botão de login, dezena do volante).
+# 5. O HTML do elemento será destacado. Clique com o botão direito > Copy > Copy selector.
+# 6. Cole o seletor copiado na variável correspondente abaixo.
+# ============================================================
+
+SELETORES = {
+    # Botão de aceitar cookies (popup inicial)
+    "btn_aceitar_cookies": "#onetrust-accept-btn-handler",
+
+    # Login
+    "btn_entrar": "button[title='Entrar'], .login-btn, a[href*='login']",
+    "input_cpf": "input[name='cpf'], input[id='cpf']",
+    "input_senha": "input[name='password'], input[type='password']",
+    "btn_logar": "button[type='submit'], button.btn-login",
+
+    # Volante de apostas
+    # Cada dezena geralmente é um elemento clicável com um atributo data-numero ou texto igual ao número.
+    "dezena_volante": "li[data-numero], div[data-numero]",
+
+    # Botão para adicionar aposta ao carrinho
+    "btn_adicionar_carrinho": "button.btn-add-to-cart, button[title='Adicionar ao carrinho'], .add-cart-btn",
+
+    # Indicador de carregamento/loading (overlay)
+    "loading_overlay": ".loading-overlay, .spinner",
+
+    # Botão do carrinho para capturar a URL
+    "btn_carrinho": "a[href*='carrinho'], .cart-icon, .shopping-cart",
+}
+
+# Tempo máximo de espera padrão (em segundos) para elementos aparecerem
+TEMPO_ESPERA = 20
 
 
-# -----------------------------------------------------------------------------
-# Theme Layer
-# -----------------------------------------------------------------------------
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
 
-def apply_white_theme():
-    st.markdown(
-        """
-        <style>
-            .stApp { background-color: #ffffff; color: #1f2933; }
-            h1, h2, h3, h4 { color: #0b3d91; }
-            .stTabs [data-baseweb="tab"] {
-                color: #0b3d91;
-                border-bottom: 3px solid transparent;
-            }
-            .stTabs [aria-selected="true"] {
-                border-bottom: 3px solid #0b3d91;
-                color: #0b3d91;
-                font-weight: bold;
-            }
-            .metric-card {
-                background-color: #f4f7fb;
-                border-left: 5px solid #0b3d91;
-                padding: 12px 16px;
-                border-radius: 8px;
-            }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+def configurar_navegador():
+    """Configura e inicializa o Chrome WebDriver com opções robustas."""
+    print("[INFO] Configurando o navegador Chrome...")
+    chrome_options = Options()
+    # Descomente a linha abaixo para rodar em modo headless (sem interface gráfica)
+    # chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-notifications")
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--disable-infobars")
+    chrome_options.add_experimental_option("prefs", {
+        "profile.default_content_setting_values.cookies": 1
+    })
+
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.set_page_load_timeout(60)
+    return driver
 
 
-def apply_blue_theme():
-    st.markdown(
-        """
-        <style>
-            .stApp { background-color: #0b3d91; color: #ffffff; }
-            h1, h2, h3, h4 { color: #ffd166; }
-            .stTabs [data-baseweb="tab"] {
-                color: #ffffff;
-                border-bottom: 3px solid transparent;
-            }
-            .stTabs [aria-selected="true"] {
-                border-bottom: 3px solid #ffd166;
-                color: #ffd166;
-                font-weight: bold;
-            }
-            .stSidebar { background-color: #072c6b; }
-            .metric-card {
-                background-color: #072c6b;
-                border-left: 5px solid #ffd166;
-                padding: 12px 16px;
-                border-radius: 8px;
-                color: #ffffff;
-            }
-            .stDataFrame { color: #0b3d91; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# -----------------------------------------------------------------------------
-# Data Layer
-# -----------------------------------------------------------------------------
-
-@st.cache_data(show_spinner=False)
-def carregar_dados_dia_de_sorte(n_concursos: int = 500, seed: int = 42) -> pd.DataFrame:
-    """Gera dados sinteticos da loteria Dia de Sorte.
-
-    Cada concurso possui 7 dezenas (1 a 31) e um Mes da Sorte (1 a 12).
-    """
-    rng = np.random.default_rng(seed)
-    dezenas = []
-    meses = []
-    for _ in range(n_concursos):
-        numeros = sorted(rng.choice(range(1, 32), size=7, replace=False).tolist())
-        dezenas.append(numeros)
-        meses.append(int(rng.integers(1, 13)))
-
-    df = pd.DataFrame(dezenas, columns=[f"D{i}" for i in range(1, 8)])
-    df.insert(0, "Concurso", range(1, n_concursos + 1))
-    df["Mes_Sorte"] = meses
-    return df
-
-
-# -----------------------------------------------------------------------------
-# Domain Layer
-# -----------------------------------------------------------------------------
-
-def matriz_coocorrencia(df: pd.DataFrame) -> pd.DataFrame:
-    """Constroi a matriz de coocorrencia 31x31 entre as dezenas."""
-    dezena_cols = [f"D{i}" for i in range(1, 8)]
-    total = 31
-    matriz = np.zeros((total, total), dtype=int)
-
-    for _, row in df.iterrows():
-        nums = row[dezena_cols].tolist()
-        for i in nums:
-            for j in nums:
-                matriz[i - 1, j - 1] += 1
-
-    labels = list(range(1, total + 1))
-    return pd.DataFrame(matriz, index=labels, columns=labels)
-
-
-def monte_carlo_dia_de_sorte(
-    df: pd.DataFrame,
-    n_simulacoes: int = 1000,
-    seed: int = 7,
-) -> pd.DataFrame:
-    """Simula sorteios aleatorios para estimar a coocorrencia esperada."""
-    rng = np.random.default_rng(seed)
-    total = 31
-    matriz = np.zeros((total, total), dtype=int)
-    n_concursos = len(df)
-
-    for _ in range(n_simulacoes):
-        for _ in range(n_concursos):
-            nums = rng.choice(range(1, total + 1), size=7, replace=False)
-            for i in nums:
-                for j in nums:
-                    matriz[i - 1, j - 1] += 1
-
-    matriz = matriz / n_simulacoes
-    labels = list(range(1, total + 1))
-    return pd.DataFrame(matriz, index=labels, columns=labels)
-
-
-def analisar_dia_de_sorte(df: pd.DataFrame, n_simulacoes: int = 1000) -> pd.DataFrame:
-    """Calcula a Forca (Real / Esperado) para cada par de dezenas."""
-    real = matriz_coocorrencia(df)
-    esperado = monte_carlo_dia_de_sorte(df, n_simulacoes=n_simulacoes)
-
-    registros = []
-    for i in range(1, 32):
-        for j in range(i + 1, 32):
-            r = real.loc[i, j]
-            e = esperado.loc[i, j]
-            forca = r / e if e > 0 else 0.0
-            registros.append(
-                {
-                    "Dezena_A": i,
-                    "Dezena_B": j,
-                    "Coocorrencia_Real": int(r),
-                    "Coocorrencia_Esperada": round(float(e), 2),
-                    "Forca": round(float(forca), 3),
-                }
-            )
-
-    return pd.DataFrame(registros).sort_values("Forca", ascending=False).reset_index(drop=True)
-
-
-def analisar_mes_de_sorte(df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula a Forca (Real / Esperado) para cada Mes da Sorte.
-
-    Real  -> frequencia observada do mes nos concursos.
-    Esperado -> frequencia esperada se a distribuicao fosse uniforme (1/12).
-    """
-    n_concursos = len(df)
-    esperado_por_mes = n_concursos / 12.0
-
-    contagem = df["Mes_Sorte"].value_counts().reindex(range(1, 13), fill_value=0)
-
-    resultado = pd.DataFrame(
-        {
-            "Mes": list(range(1, 13)),
-            "Nome_Mes": [
-                "Janeiro", "Fevereiro", "Marco", "Abril", "Maio", "Junho",
-                "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
-            ],
-            "Frequencia_Real": contagem.values.astype(int),
-            "Frequencia_Esperada": round(esperado_por_mes, 2),
-        }
-    )
-    resultado["Forca"] = (
-        resultado["Frequencia_Real"] / resultado["Frequencia_Esperada"]
-    ).round(3)
-    return resultado.sort_values("Forca", ascending=False).reset_index(drop=True)
-
-
-# -----------------------------------------------------------------------------
-# UI Layer
-# -----------------------------------------------------------------------------
-
-def render_dashboard(df: pd.DataFrame):
-    st.title("Dia de Sorte - Analise Estatistica")
-    st.caption("Analise de pares, coocorrencia, base de dados e Mes da Sorte.")
-
-    with st.spinner("Processando analises..."):
-        analise_pares = analisar_dia_de_sorte(df, n_simulacoes=200)
-        matriz = matriz_coocorrencia(df)
-        analise_mes = analisar_mes_de_sorte(df)
-
-    tab1, tab2, tab3, tab4 = st.tabs(
-        [
-            "Analise de Forca (Pares)",
-            "Heatmap de Coocorrencia",
-            "Base de Dados",
-            "Mes de Sorte",
-        ]
-    )
-
-    # --- Tab 1: Forca de Pares ---
-    with tab1:
-        st.subheader("Top Pares por Forca (Real / Esperado)")
-        st.markdown(
-            "<div class='metric-card'>"
-            "Forca > 1 indica que o par aparece mais do que o esperado pelo acaso."
-            "</div>",
-            unsafe_allow_html=True,
+def aceitar_cookies(driver, wait):
+    """Tenta fechar o popup de cookies se estiver presente."""
+    try:
+        print("[INFO] Verificando popup de cookies...")
+        btn_cookies = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, SELETORES["btn_aceitar_cookies"]))
         )
-        st.write("")
+        btn_cookies.click()
+        print("[INFO] Cookies aceitos.")
+        time.sleep(1)
+    except TimeoutException:
+        print("[INFO] Popup de cookies não encontrado ou já aceito.")
 
-        top_n = st.slider("Numero de pares a exibir:", 10, 100, 30, key="slider_pares")
-        top_pares = analise_pares.head(top_n)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Pares analisados", len(analise_pares))
-        col2.metric("Maior Forca", f"{analise_pares['Forca'].max():.3f}")
-        col3.metric("Forca media", f"{analise_pares['Forca'].mean():.3f}")
-
-        st.dataframe(top_pares, use_container_width=True, hide_index=True)
-
-        fig_pares = px.bar(
-            top_pares,
-            x="Forca",
-            y=top_pares.apply(lambda r: f"{int(r['Dezena_A']):02d}-{int(r['Dezena_B']):02d}", axis=1),
-            orientation="h",
-            color="Forca",
-            color_continuous_scale="Blues",
-            title=f"Top {top_n} Pares por Forca",
-            labels={"y": "Par de Dezenas", "Forca": "Forca (Real/Esperado)"},
+def fazer_login(driver, wait, cpf, senha):
+    """Realiza o login no site da Caixa usando CPF e senha."""
+    print("[INFO] Iniciando processo de login...")
+    try:
+        btn_entrar = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, SELETORES["btn_entrar"]))
         )
-        fig_pares.update_layout(yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_pares, use_container_width=True)
+        btn_entrar.click()
+        print("[INFO] Tela de login aberta.")
 
-    # --- Tab 2: Heatmap ---
-    with tab2:
-        st.subheader("Matriz de Coocorrencia (31x31)")
-        st.markdown(
-            "<div class='metric-card'>"
-            "Contagem de vezes que duas dezenas apareceram no mesmo concurso."
-            "</div>",
-            unsafe_allow_html=True,
+        input_cpf = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, SELETORES["input_cpf"]))
         )
-        st.write("")
+        input_cpf.clear()
+        input_cpf.send_keys(cpf)
 
-        fig_heat = px.imshow(
-            matriz,
-            labels=dict(x="Dezena B", y="Dezena A", color="Coocorrencia"),
-            x=matriz.columns,
-            y=matriz.index,
-            color_continuous_scale="Blues",
-            title="Heatmap de Coocorrencia",
-            aspect="auto",
+        input_senha = driver.find_element(By.CSS_SELECTOR, SELETORES["input_senha"])
+        input_senha.clear()
+        input_senha.send_keys(senha)
+
+        btn_logar = driver.find_element(By.CSS_SELECTOR, SELETORES["btn_logar"])
+        btn_logar.click()
+
+        # Aguarda o login ser processado (espera o botão de entrar sumir ou painel do usuário aparecer)
+        time.sleep(5)
+        print("[INFO] Login realizado com sucesso (presumido).")
+    except TimeoutException as e:
+        print("[ERRO] Não foi possível encontrar os campos de login. Verifique os seletores CSS.")
+        raise e
+    except Exception as e:
+        print(f"[ERRO] Falha durante o login: {e}")
+        raise e
+
+
+def navegar_para_loteria(driver, wait, slug):
+    """Navega até a página da loteria correspondente ao slug."""
+    print(f"[INFO] Navegando para a loteria: {slug}...")
+    path = URLS_LOTERIAS.get(slug)
+    if not path:
+        raise ValueError(f"Loteria '{slug}' não suportada. Slugs válidos: {list(URLS_LOTERIAS.keys())}")
+
+    url_loteria = f"{URL_BASE}{path}"
+    driver.get(url_loteria)
+
+    # Aguarda o volante carregar
+    try:
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, SELETORES["dezena_volante"])))
+        print(f"[INFO] Página da loteria {slug} carregada.")
+    except TimeoutException:
+        print(f"[ERRO] O volante da loteria {slug} não carregou. Verifique a URL e os seletores.")
+        raise
+
+
+def clicar_dezena(driver, wait, numero):
+    """Clica em uma dezena específica no volante virtual."""
+    # Tenta encontrar a dezena pelo atributo data-numero
+    try:
+        dezena = driver.find_element(By.CSS_SELECTOR, f"{SELETORES['dezena_volante']}[data-numero='{numero}']")
+        driver.execute_script("arguments[0].scrollIntoView(true);", dezena)
+        time.sleep(0.2)
+        dezena.click()
+        return True
+    except (NoSuchElementException, ElementClickInterceptedException):
+        pass
+
+    # Fallback: tenta encontrar pelo texto do elemento
+    try:
+        elementos = driver.find_elements(By.CSS_SELECTOR, SELETORES["dezena_volante"])
+        for el in elementos:
+            if el.text.strip() == str(numero):
+                driver.execute_script("arguments[0].scrollIntoView(true);", el)
+                time.sleep(0.2)
+                el.click()
+                return True
+    except Exception as e:
+        print(f"[ERRO] Falha ao clicar na dezena {numero}: {e}")
+
+    print(f"[ALERTA] Dezena {numero} não encontrada no volante.")
+    return False
+
+
+def aguardar_carregamento(driver, wait):
+    """Aguarda possíveis overlays de loading desaparecerem."""
+    try:
+        overlay = driver.find_element(By.CSS_SELECTOR, SELETORES["loading_overlay"])
+        wait.until(EC.invisibility_of_element(overlay))
+    except NoSuchElementException:
+        # Se não houver overlay, segue o fluxo
+        pass
+    except TimeoutException:
+        print("[ALERTA] Timeout aguardando carregamento, prosseguindo...")
+
+
+def preencher_aposta(driver, wait, dezenas):
+    """Preenche uma aposta clicando nas dezenas e adicionando ao carrinho."""
+    print(f"[INFO] Preenchendo aposta com dezenas: {dezenas}")
+
+    # Clica em cada dezena
+    for numero in dezenas:
+        if not clicar_dezena(driver, wait, numero):
+            print(f"[ERRO] Não foi possível selecionar a dezena {numero}. Abortando esta aposta.")
+            return False
+        time.sleep(0.3)  # Pequena pausa para a animação do site
+
+    # Clica em adicionar ao carrinho
+    try:
+        btn_add = wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, SELETORES["btn_adicionar_carrinho"]))
         )
-        fig_heat.update_layout(height=650)
-        st.plotly_chart(fig_heat, use_container_width=True)
+        btn_add.click()
+        print("[INFO] Aposta adicionada ao carrinho.")
+        aguardar_carregamento(driver, wait)
+        time.sleep(2)
+        return True
+    except TimeoutException:
+        print("[ERRO] Botão 'Adicionar ao carrinho' não encontrado ou não clicável.")
+        return False
 
-    # --- Tab 3: Base de Dados ---
-    with tab3:
-        st.subheader("Base de Dados - Dia de Sorte")
-        st.markdown(
-            f"<div class='metric-card'>"
-            f"Total de concursos: <b>{len(df)}</b> | Dezenas por concurso: 7 | Mes da Sorte: 1-12"
-            f"</div>",
-            unsafe_allow_html=True,
+
+def obter_url_carrinho(driver, wait):
+    """Tenta capturar a URL do carrinho de compras."""
+    try:
+        btn_carrinho = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, SELETORES["btn_carrinho"]))
         )
-        st.write("")
-
-        filtro_mes = st.multiselect(
-            "Filtrar por Mes da Sorte:",
-            options=list(range(1, 13)),
-            format_func=lambda m: [
-                "Janeiro", "Fevereiro", "Marco", "Abril", "Maio", "Junho",
-                "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
-            ][m - 1],
-            key="filtro_mes",
-        )
-
-        df_exibir = df.copy()
-        if filtro_mes:
-            df_exibir = df_exibir[df_exibir["Mes_Sorte"].isin(filtro_mes)]
-
-        st.dataframe(df_exibir, use_container_width=True, hide_index=True)
-        st.download_button(
-            label="Baixar base filtrada (CSV)",
-            data=df_exibir.to_csv(index=False).encode("utf-8"),
-            file_name="dia_de_sorte_dados.csv",
-            mime="text/csv",
-        )
-
-    # --- Tab 4: Mes de Sorte ---
-    with tab4:
-        st.subheader("Analise do Mes da Sorte")
-        st.markdown(
-            "<div class='metric-card'>"
-            "Forca = Frequencia Real / Frequencia Esperada (uniforme 1/12). "
-            "Valores > 1 indicam meses sorteados acima do esperado."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        st.write("")
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Mes mais forte", analise_mes.iloc[0]["Nome_Mes"])
-        col2.metric("Maior Forca", f"{analise_mes['Forca'].max():.3f}")
-        col3.metric("Forca media", f"{analise_mes['Forca'].mean():.3f}")
-
-        st.dataframe(analise_mes, use_container_width=True, hide_index=True)
-
-        fig_mes = px.bar(
-            analise_mes,
-            x="Nome_Mes",
-            y="Forca",
-            color="Forca",
-            color_continuous_scale="Blues",
-            text="Forca",
-            title="Forca dos Meses da Sorte (Real / Esperado)",
-            labels={"Nome_Mes": "Mes", "Forca": "Forca"},
-        )
-        fig_mes.update_traces(texttemplate="%{text:.3f}", textposition="outside")
-        fig_mes.add_hline(
-            y=1.0,
-            line_dash="dash",
-            line_color="red",
-            annotation_text="Esperado (Forca = 1)",
-            annotation_position="top left",
-        )
-        fig_mes.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig_mes, use_container_width=True)
+        href = btn_carrinho.get_attribute("href")
+        if href:
+            return href
+        # Se não houver href, clica para acessar o carrinho e captura a URL
+        btn_carrinho.click()
+        time.sleep(2)
+        return driver.current_url
+    except Exception:
+        return f"{URL_BASE}carrinho"
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
+def ler_arquivo_json(caminho):
+    """Lê e valida o arquivo JSON gerado pelo Motor Analítico."""
+    print(f"[INFO] Lendo arquivo JSON: {caminho}")
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            dados = json.load(f)
 
-def main():
-    st.set_page_config(
-        page_title="Dia de Sorte - Streamlit",
-        page_icon="🍀",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
+        if "loteria" not in dados or "apostas" not in dados:
+            raise ValueError("JSON inválido: campos 'loteria' e 'apostas' são obrigatórios.")
 
-    with st.sidebar:
-        st.header("Configuracoes")
-        tema = st.radio(
-            "Escolha o tema:",
-            options=["Branco", "Azul Corporativo"],
-            index=0,
-            key="tema_selecionado",
-        )
+        print(f"[INFO] Loteria: {dados['loteria']} | Total de apostas: {len(dados['apostas'])}")
+        return dados
+    except FileNotFoundError:
+        print(f"[ERRO] Arquivo não encontrado: {caminho}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"[ERRO] Falha ao decodificar JSON: {e}")
+        sys.exit(1)
 
-        n_concursos = st.slider(
-            "Numero de concursos simulados:",
-            min_value=100,
-            max_value=2000,
-            value=500,
-            step=100,
-            key="slider_concursos",
-        )
 
-        st.markdown("---")
-        st.caption("App construido exclusivamente com Streamlit.")
+def obter_credenciais():
+    """Obtém CPF e senha via variáveis de ambiente ou input do terminal."""
+    cpf = os.getenv("CAIXA_CPF")
+    senha = os.getenv("CAIXA_SENHA")
 
-    if tema == "Branco":
-        apply_white_theme()
-    else:
-        apply_blue_theme()
+    if not cpf:
+        cpf = input("Digite seu CPF (somente números): ").strip()
+    if not senha:
+        senha = input("Digite sua senha da Caixa: ").strip()
 
-    df = carregar_dados_dia_de_sorte(n_concursos=n_concursos)
-    render_dashboard(df)
+    return cpf, senha
 
+
+# ============================================================
+# FUNÇÃO PRINCIPAL
+# ============================================================
+
+def main(caminho_json):
+    dados = ler_arquivo_json(caminho_json)
+    slug = dados["loteria"].lower()
+    apostas = dados["apostas"]
+
+    cpf, senha = obter_credenciais()
+
+    driver = configurar_navegador()
+    wait = WebDriverWait(driver, TEMPO_ESPERA)
+
+    apostas_preenchidas = 0
+    custo_estimado = 0.0
+
+    try:
+        print("[INFO] Acessando o site de Loterias Online da Caixa...")
+        driver.get(URL_BASE)
+        aceitar_cookies(driver, wait)
+
+        fazer_login(driver, wait, cpf, senha)
+        navegar_para_loteria(driver, wait, slug)
+
+        for aposta in apostas:
+            aposta_id = aposta.get("id", "?")
+            dezenas = aposta.get("dezenas", [])
+            print(f"\n[INFO] Processando Aposta #{aposta_id}...")
+
+            sucesso = preencher_aposta(driver, wait, dezenas)
+            if sucesso:
+                apostas_preenchidas += 1
+                # O custo estimado depende da loteria e quantidade de dezenas.
+                # Aqui usamos um valor base simplificado; ajuste conforme tabela da Caixa.
+                # Exemplo: Mega-Sena 6 dezenas = R$ 5,00 (valor ilustrativo).
+                custo_base = 5.0
+                custo_estimado += custo_base
+            else:
+                print(f"[ALERTA] Aposta #{aposta_id} não foi concluída.")
+
+            aguardar_carregamento(driver, wait)
+
+        url_carrinho = obter_url_carrinho(driver, wait)
+
+        # Resumo final
+        print("\n" + "=" * 60)
+        print("RESUMO DA EXECUÇÃO")
+        print("=" * 60)
+        print(f"Total de apostas no JSON: {len(apostas)}")
+        print(f"Apostas preenchidas:      {apostas_preenchidas}")
+        print(f"Custo estimado:           R$ {custo_estimado:.2f} (valor ilustrativo)")
+        print(f"URL do carrinho:          {url_carrinho}")
+        print("=" * 60)
+        print("[INFO] Revise o carrinho no navegador antes de finalizar a compra.")
+
+        # Mantém o navegador aberto para revisão manual
+        input("\n[INFO] Pressione ENTER para fechar o navegador...")
+
+    except Exception as e:
+        print(f"\n[ERRO CRÍTICO] {e}")
+        print("[INFO] O navegador será mantido aberto para inspeção.")
+        input("Pressione ENTER para fechar o navegador...")
+    finally:
+        print("[INFO] Fechando o navegador...")
+        driver.quit()
+
+
+# ============================================================
+# PONTO DE ENTRADA
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+    # Verifica se o caminho do arquivo JSON foi passado como argumento
+    if len(sys.argv) < 2:
+        print("Uso: python loteria_selenium.py <caminho_para_arquivo.json>")
+        print("Exemplo: python loteria_selenium.py apostas_megasena.json")
+        sys.exit(1)
+
+    caminho_arquivo = sys.argv[1]
+    main(caminho_arquivo)
